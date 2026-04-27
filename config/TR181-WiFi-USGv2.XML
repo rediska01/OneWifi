@@ -1907,6 +1907,12 @@ INSTMSMT_PH2 -->
                     </functions>
                     <parameters>
                         <parameter>
+                            <name>MLDUnit</name>
+                            <type>int[-1:24]</type>
+                            <syntax>int</syntax>
+                            <writable>true</writable>
+                        </parameter>
+                        <parameter>
                             <name>Enable</name>
                             <type>boolean</type>
                             <syntax>bool</syntax>
@@ -2661,7 +2667,7 @@ INSTMSMT_PH2 -->
                                 </parameter>
                                 <parameter>
                                     <name>X_CISCO_COM_EncryptionMethod</name>
-                                    <type>string: TKIP(1),AES(2),AES+TKIP(3)</type>
+                                    <type>string: TKIP(1),AES(2),AES+TKIP(3),AES+GCMP(4)</type>
                                     <syntax>uint32/mapped</syntax>
                                     <writable>true</writable>
                                 </parameter>
