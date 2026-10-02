@@ -37,6 +37,10 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <ifaddrs.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #define  ARRAY_SZ(x)    (sizeof(x) / sizeof((x)[0]))
 /* enable PID in debug logs */
@@ -351,12 +355,35 @@ void write_to_file(const char *file_name, char *fmt, ...)
 {
     FILE *fp = NULL;
     va_list args;
+    static const char *sem_name = "/wifi_health_log_sem";
+    sem_t *sem = sem_open(sem_name, O_CREAT, 0666, 1);
+    if (sem == SEM_FAILED) {
+        wifi_util_error_print(WIFI_CTRL,
+            "%s:%d sem_open failed errno=%d\n",
+            __func__, __LINE__, errno);
+        return;
+    }
+     while (sem_wait(sem) == -1) {
+        if (errno == EINTR)
+            continue;
+
+        wifi_util_error_print(WIFI_CTRL,
+            "%s:%d sem_wait failed errno=%d\n",
+            __func__, __LINE__, errno);
+
+        sem_close(sem);
+        return;
+    }
+
+
 
     fp = fopen(file_name, "a+");
 
     if (fp == NULL) {
         wifi_util_dbg_print(WIFI_CTRL,"%s:%d: Error, open file_name: %s\n",__func__, __LINE__, file_name);
-        return;
+        sem_post(sem);
+        sem_close(sem);
+	return;
     }
 
     va_start(args, fmt);
@@ -365,6 +392,8 @@ void write_to_file(const char *file_name, char *fmt, ...)
 
     fflush(fp);
     fclose(fp);
+    sem_post(sem);
+    sem_close(sem);
 }
 
 void copy_string(char*  destination, char*  source)
@@ -717,7 +746,7 @@ char *get_formatted_time(char *time)
     return time;
 }
 
-void wifi_util_print(wifi_log_level_t level, wifi_dbg_type_t module, char *format, ...)
+void wifi_util_print(wifi_log_level_t level, wifi_dbg_type_t module, const char *format, ...)
 {
     char buff[256] = {0};
     va_list list;
@@ -840,6 +869,11 @@ void wifi_util_print(wifi_log_level_t level, wifi_dbg_type_t module, char *forma
         case WIFI_EC: {
             snprintf(filename_dbg_enable, sizeof(filename_dbg_enable), LOG_PATH_PREFIX "wifiEc");
             snprintf(module_filename, sizeof(module_filename), "wifiEc");
+            break;
+        }
+        case WIFI_SENSING: {
+            snprintf(filename_dbg_enable, sizeof(filename_dbg_enable), LOG_PATH_PREFIX "wifiSensing");
+            snprintf(module_filename, sizeof(module_filename), "wifiSensing");
             break;
         }
         default:
@@ -2892,6 +2926,96 @@ int convert_radio_index_to_freq_band(wifi_platform_property_t *wifi_prop, unsign
     return RETURN_ERR;
 }
 
+typedef struct {
+    wifi_freq_bands_t band;
+    const char *band_str;
+} freq_band_str_map_t;
+
+static const freq_band_str_map_t freq_band_str_map[] = {
+    { WIFI_FREQUENCY_2_4_BAND, NAME_FREQUENCY_2_4_G },
+    { WIFI_FREQUENCY_5_BAND,   NAME_FREQUENCY_5_G },
+    { WIFI_FREQUENCY_5L_BAND,  NAME_FREQUENCY_5L_G },
+    { WIFI_FREQUENCY_5H_BAND,  NAME_FREQUENCY_5H_G },
+    { WIFI_FREQUENCY_6_BAND,   NAME_FREQUENCY_6_G },
+};
+
+const char *convert_freq_band_to_band_str_g(int freq_band)
+{
+    unsigned int i = 0;
+
+    for (i = 0; i < ARRAY_SIZE(freq_band_str_map); i++) {
+        if (freq_band_str_map[i].band == (wifi_freq_bands_t)freq_band) {
+            return freq_band_str_map[i].band_str;
+        }
+    }
+    return NULL;
+}
+
+#if defined(CONFIG_IEEE80211BE)
+#define MLO_SUFFIX "_mlo"
+#define MLO_SUFFIX_LEN 4
+bool is_mlo_vap_name(const char *name)
+{
+    size_t len = 0;
+
+    if (name == NULL) {
+        return false;
+    }
+    len = strlen(name);
+    return (len > MLO_SUFFIX_LEN && strncmp(name + len - MLO_SUFFIX_LEN, MLO_SUFFIX, MLO_SUFFIX_LEN) == 0);
+}
+
+static bool get_mlo_base_name(const char *mlo_vap_name, char *base, size_t base_size)
+{
+    size_t base_len = 0;
+
+    if (base == NULL || !is_mlo_vap_name(mlo_vap_name)) {
+        return false;
+    }
+    base_len = strlen(mlo_vap_name) - MLO_SUFFIX_LEN;
+    if (base_len >= base_size) {
+        return false;
+    }
+    memcpy(base, mlo_vap_name, base_len);
+    base[base_len] = '\0';
+    return true;
+}
+
+bool get_per_radio_vap_name_from_mlo(const char *mlo_vap_name, const char *band_str, char *out, size_t out_size)
+{
+    wifi_vap_name_t base = { 0 };
+
+    if (!get_mlo_base_name(mlo_vap_name, base, sizeof(base))) {
+        return false;
+    }
+    snprintf(out, out_size, "%s_%s", base, band_str);
+    return true;
+}
+
+bool get_mlo_vap_name_from_per_radio(const char *vap_name, char *out, size_t out_size)
+{
+    int len = 0;
+    unsigned int i = 0;
+    const char *last_underscore = NULL;
+
+    if (vap_name == NULL || out == NULL) {
+        return false;
+    }
+    last_underscore = strrchr(vap_name, '_');
+    if (last_underscore == NULL) {
+        return false;
+    }
+    for (i = 0; i < ARRAY_SIZE(freq_band_str_map); i++) {
+        if (strcmp(last_underscore + 1, freq_band_str_map[i].band_str) == 0) {
+            len = last_underscore - vap_name;
+            snprintf(out, out_size, "%.*s" MLO_SUFFIX, len, vap_name);
+            return true;
+        }
+    }
+    return false;
+}
+#endif /* CONFIG_IEEE80211BE */
+
 struct wifiStdHalMap
 {
     wifi_ieee80211Variant_t halWifiStd;
@@ -3970,8 +4094,6 @@ bool is_vap_param_config_changed(wifi_vap_info_t *vap_info_old, wifi_vap_info_t 
             //should not be executed for BPi
             IS_CHANGED(vap_info_old->u.bss_info.mld_info.common_info.mld_link_id,
                 vap_info_new->u.bss_info.mld_info.common_info.mld_link_id) ||
-            IS_CHANGED(vap_info_old->u.bss_info.mld_info.common_info.mld_apply,
-                vap_info_new->u.bss_info.mld_info.common_info.mld_apply) ||
             is_mld_addr_changed(vap_info_old, vap_info_new) ||
 #endif // CONFIG_IEEE80211BE && !CONFIG_GENERIC_MLO
             IS_CHANGED(vap_info_old->u.bss_info.hostap_mgt_frame_ctrl,
@@ -4777,3 +4899,86 @@ bool is_valid_encr_for_mode(wifi_security_modes_t mode, wifi_encryption_method_t
 
     return (valid_mask & (1u << encr)) != 0;
 }
+
+void apply_wpa2_personal_encr_policy(wifi_vap_security_t *security_info)
+{
+    if (security_info == NULL || security_info->mode != wifi_security_mode_wpa2_personal) {
+        return;
+    }
+
+    if (security_info->encr == wifi_encryption_aes_gcmp256) {
+        wifi_util_info_print(WIFI_WEBCONFIG,
+            "%s:%d enforcing WPA2-Personal encryption fallback AES+GCMP(%d)->AES(%d)\n", __func__,
+            __LINE__, wifi_encryption_aes_gcmp256, wifi_encryption_aes);
+        security_info->encr = wifi_encryption_aes;
+        return;
+    }
+
+    /* Preserve valid WPA2 encryptions (AES, AES+TKIP); normalize anything else to AES. */
+    if (security_info->encr != wifi_encryption_aes &&
+        security_info->encr != wifi_encryption_aes_tkip) {
+        wifi_util_info_print(WIFI_WEBCONFIG,
+            "%s:%d enforcing WPA2-Personal encryption fallback invalid(%d)->AES(%d)\n", __func__,
+            __LINE__, security_info->encr, wifi_encryption_aes);
+        security_info->encr = wifi_encryption_aes;
+    }
+}
+
+void apply_wpa3_transition_encr_policy(wifi_vap_security_t *security_info)
+{
+    if (security_info == NULL || security_info->mode != wifi_security_mode_wpa3_transition) {
+        return;
+    }
+
+#ifdef CONFIG_IEEE80211BE
+    /* 11be builds use AES+GCMP as the policy default for WPA3-Transition. */
+    security_info->encr = wifi_encryption_aes_gcmp256;
+#else
+    security_info->encr = wifi_encryption_aes;
+#endif /* CONFIG_IEEE80211BE */
+}
+
+int get_mesh_sta_mac_address_for_radio(wifi_platform_property_t *wifi_prop, unsigned int radio_index, mac_address_t mac)
+{
+    int index;
+    int num_vaps;
+    wifi_interface_name_idex_map_t *if_prop;
+    char st[64] = "";
+
+    if ((wifi_prop == NULL) || (wifi_prop->interface_map == NULL) || (mac == NULL)) {
+         return -1;
+    }
+
+    memset(mac, 0, sizeof(mac_address_t));
+    TOTAL_INTERFACES(num_vaps, wifi_prop);
+    if_prop = wifi_prop->interface_map;
+
+    for (index = 0; index < num_vaps; ++index) {
+        if (if_prop->rdk_radio_index == radio_index) {
+            if (!strncmp(if_prop->vap_name, "mesh_sta", strlen("mesh_sta"))) {
+                mac_address_from_name(if_prop->interface_name, mac);
+                uint8_mac_to_string_mac(mac, st);
+                wifi_util_info_print(WIFI_CTRL, "%s:%d interface_name=%s and mac address=%s\n",
+                    __func__, __LINE__, if_prop->interface_name, st);
+                return 0;
+            }
+        }
+        if_prop++;
+    }
+
+    return -1;
+}
+ void copy_assocstats_dev_stats(wifi_associated_dev3_t* assoc_dev,dev_stats_t *dev)
+ {
+ 
+    dev->cli_PacketsSent = assoc_dev->cli_PacketsSent;  
+   dev->cli_PacketsReceived = assoc_dev->cli_PacketsReceived;  
+   dev->cli_RetransCount = assoc_dev->cli_RetransCount;  
+   dev->cli_RxRetries = assoc_dev->cli_RxRetries;  
+   dev->cli_SNR = assoc_dev->cli_SNR;  
+   dev->cli_MaxDownlinkRate = assoc_dev->cli_MaxDownlinkRate;  
+   dev->cli_MaxUplinkRate = assoc_dev->cli_MaxUplinkRate;  
+   dev->cli_LastDataDownlinkRate = assoc_dev->cli_LastDataDownlinkRate;  
+   dev->cli_LastDataUplinkRate = assoc_dev->cli_LastDataUplinkRate;  
+   dev->cli_sleepTime = assoc_dev->cli_sleepTime;
+ } 
